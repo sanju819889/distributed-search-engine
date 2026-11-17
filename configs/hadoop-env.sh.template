@@ -1,0 +1,9 @@
+# configs/hadoop-env.sh.template
+# Copy this to /opt/hadoop/etc/hadoop/hadoop-env.sh
+
+export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+
+# Heap size limits to prevent Out-Of-Memory (OOM) on student VMs
+export HADOOP_NAMENODE_OPTS="-Xms512m -Xmx1024m"
+export HADOOP_DATANODE_OPTS="-Xms512m -Xmx1024m"
+export HADOOP_LOG_DIR=/opt/hadoop/logs

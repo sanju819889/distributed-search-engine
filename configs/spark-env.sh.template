@@ -1,0 +1,9 @@
+# configs/spark-env.sh.template
+# Copy to /opt/spark/conf/spark-env.sh
+
+export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+export HADOOP_CONF_DIR=/opt/hadoop/etc/hadoop
+export SPARK_MASTER_HOST="node3"
+
+# Replace with your machine's own ZeroTier IP address:
+# export SPARK_LOCAL_IP="<YOUR_ZEROTIER_IP>"

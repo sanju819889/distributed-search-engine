@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Distributed Search Engine</title>
+    <style>
+        :root {
+            --primary: #1a73e8;
+            --bg: #f8f9fa;
+            --card-bg: #ffffff;
+            --text: #202124;
+            --muted: #5f6368;
+            --border: #dadce0;
+            --badge-green: #e6f4ea;
+            --badge-green-text: #137333;
+            --badge-blue: #e8f0fe;
+            --badge-blue-text: #1a73e8;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        body { background-color: var(--bg); color: var(--text); min-height: 100vh; display: flex; flex-direction: column; }
+        
+        .header {
+            padding: 1rem 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border);
+            background: white;
+        }
+        .header-title { font-weight: 600; font-size: 1.1rem; color: var(--muted); }
+        .version-badge {
+            background: var(--badge-blue);
+            color: var(--badge-blue-text);
+            padding: 0.35rem 0.8rem;
+            border-radius: 16px;
+            font-size: 0.85rem;
+            font-weight: 600;
+        }
+
+        .hero {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 3rem 1rem 1.5rem;
+        }
+        .logo { font-size: 2.8rem; font-weight: 700; margin-bottom: 1.5rem; letter-spacing: -0.5px; }
+        .logo span:nth-child(1) { color: #4285F4; }
+        .logo span:nth-child(2) { color: #EA4335; }
+        .logo span:nth-child(3) { color: #FBBC05; }
+        .logo span:nth-child(4) { color: #4285F4; }
+        .logo span:nth-child(5) { color: #34A853; }
+        .logo span:nth-child(6) { color: #EA4335; }
+
+        .search-box {
+            width: 100%;
+            max-width: 650px;
+            position: relative;
+        }
+        .search-input {
+            width: 100%;
+            padding: 0.9rem 1.25rem;
+            padding-right: 5rem;
+            border-radius: 28px;
+            border: 1px solid var(--border);
+            outline: none;
+            font-size: 1.05rem;
+            box-shadow: 0 1px 6px rgba(32,33,36,0.1);
+            transition: all 0.2s;
+        }
+        .search-input:focus {
+            box-shadow: 0 1px 8px rgba(26,115,232,0.3);
+            border-color: var(--primary);
+        }
+        .search-btn {
+            position: absolute;
+            right: 8px;
+            top: 50%;
+            transform: translateY(-50%);
+            background: var(--primary);
+            color: white;
+            border: none;
+            padding: 0.55rem 1.1rem;
+            border-radius: 20px;
+            cursor: pointer;
+            font-weight: 500;
+        }
+        .search-btn:hover { background: #1557b0; }
+
+        .container {
+            max-width: 780px;
+            width: 100%;
+            margin: 0 auto;
+            padding: 0 1rem 3rem;
+        }
+        .stats-bar {
+            font-size: 0.85rem;
+            color: var(--muted);
+            margin-bottom: 1.2rem;
+            display: none;
+        }
+
+        .result-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1.2rem 1.4rem;
+            margin-bottom: 1rem;
+            transition: box-shadow 0.15s;
+        }
+        .result-card:hover {
+            box-shadow: 0 2px 10px rgba(0,0,0,0.06);
+        }
+        .res-url { font-size: 0.82rem; color: var(--muted); margin-bottom: 0.2rem; word-break: break-all; }
+        .res-title {
+            font-size: 1.15rem;
+            font-weight: 600;
+            color: var(--primary);
+            text-decoration: none;
+            margin-bottom: 0.5rem;
+            display: inline-block;
+        }
+        .res-title:hover { text-decoration: underline; }
+        .res-doc-id {
+            display: inline-block;
+            font-size: 0.75rem;
+            background: #eee;
+            padding: 0.15rem 0.4rem;
+            border-radius: 4px;
+            margin-left: 0.5rem;
+            color: #333;
+        }
+        .scores-row {
+            display: flex;
+            gap: 0.6rem;
+            margin-top: 0.6rem;
+            flex-wrap: wrap;
+        }
+        .score-pill {
+            font-size: 0.75rem;
+            padding: 0.2rem 0.5rem;
+            border-radius: 6px;
+            background: #f1f3f4;
+            color: #3c4043;
+            font-weight: 500;
+        }
+        .score-final {
+            background: var(--badge-green);
+            color: var(--badge-green-text);
+            font-weight: 700;
+        }
+        .empty-state {
+            text-align: center;
+            color: var(--muted);
+            padding: 3rem 1rem;
+            font-size: 0.95rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="header-title">Distributed Search Engine</div>
+        <div class="version-badge" id="versionBadge">Serving: {{ version }} ({{ total_docs }} docs)</div>
+    </div>
+
+    <div class="hero">
+        <div class="logo">
+            <span>S</span><span>e</span><span>a</span><span>r</span><span>c</span><span>h</span>
+        </div>
+        <div class="search-box">
+            <input type="text" id="queryInput" class="search-input" placeholder="Search knowledge base (e.g. computer, science, algorithm)..." autofocus>
+            <button class="search-btn" onclick="performSearch()">Search</button>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="stats-bar" id="statsBar"></div>
+        <div id="resultsContainer">
+            <div class="empty-state">Enter keyword query above to query the distributed cluster.</div>
+        </div>
+    </div>
+
+    <script>
+        const queryInput = document.getElementById("queryInput");
+        const resultsContainer = document.getElementById("resultsContainer");
+        const statsBar = document.getElementById("statsBar");
+
+        queryInput.addEventListener("keypress", function(e) {
+            if (e.key === "Enter") performSearch();
+        });
+
+        async function performSearch() {
+            const q = queryInput.value.trim();
+            if (!q) return;
+
+            resultsContainer.innerHTML = '<div class="empty-state">Searching cluster...</div>';
+            statsBar.style.display = "none";
+
+            try {
+                const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+                const data = await res.json();
+
+                statsBar.style.display = "block";
+                statsBar.textContent = `Found ${data.total_results} results in ${data.latency_ms} ms (Serving version: ${data.version})`;
+
+                if (!data.results || data.results.length === 0) {
+                    resultsContainer.innerHTML = '<div class="empty-state">No matching documents found.</div>';
+                    return;
+                }
+
+                let html = "";
+                data.results.forEach(item => {
+                    html += `
+                        <div class="result-card">
+                            <div class="res-url">${item.url}</div>
+                            <a href="${item.url}" target="_blank" class="res-title">${item.title || item.doc_id}</a>
+                            <span class="res-doc-id">ID: ${item.doc_id}</span>
+                            <div class="scores-row">
+                                <span class="score-pill score-final">Final Score: ${item.final_score}</span>
+                                <span class="score-pill">BM25: ${item.bm25_score} (Norm: ${item.norm_bm25})</span>
+                                <span class="score-pill">PageRank: ${item.pagerank} (Norm: ${item.norm_pagerank})</span>
+                            </div>
+                        </div>
+                    `;
+                });
+                resultsContainer.innerHTML = html;
+            } catch (err) {
+                resultsContainer.innerHTML = `<div class="empty-state" style="color:red">Search failed: ${err.message}</div>`;
+            }
+        }
+    </script>
+</body>
+</html>
