@@ -1,0 +1,21 @@
+# Datasets and Exports (DO NOT PUSH TO GIT)
+*.jsonl
+*.parquet
+/data/
+/serving/
+/checkpoints/
+
+# Spark & Hadoop binaries / JARs / logs
+*.jar
+*.tgz
+*.tar.gz
+logs/
+*.log
+*.out
+*.pid
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.env
