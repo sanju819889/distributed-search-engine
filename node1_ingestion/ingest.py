@@ -16,6 +16,11 @@ Requirements Satisfied:
 
 import sys
 import os
+
+# Ensure PySpark workers and driver use the exact same Python binary
+os.environ["PYSPARK_PYTHON"] = sys.executable
+os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+
 import argparse
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, udf, coalesce, lit
@@ -95,7 +100,7 @@ def run_ingestion(input_path, phase=None, master_url=None, warehouse_uri="hdfs:/
             col("op") == "DELETE"
         ).filter(col("doc_id").isNotNull() & (col("doc_id") != ""))
 
-        delete_ids = [r["doc_id"] for r in deletes_df.select("doc_id").distinct().collect()]
+        delete_ids = [r[0] for r in deletes_df.select("doc_id").distinct().collect() if r[0]]
         print(f"[*] Found {len(delete_ids)} DELETE operations.")
 
         if delete_ids:
@@ -121,9 +126,9 @@ def run_ingestion(input_path, phase=None, master_url=None, warehouse_uri="hdfs:/
 
         # Clean dangling links against existing docs in Iceberg + incoming upsert IDs
         existing_doc_ids = set(
-            spark.sql("SELECT doc_id FROM iceberg_catalog.lake.pages").rdd.flatMap(lambda x: x).collect()
+            r[0] for r in spark.sql("SELECT doc_id FROM iceberg_catalog.lake.pages").collect() if r[0]
         )
-        new_doc_ids = set(valid_upserts.select("doc_id").rdd.flatMap(lambda x: x).collect())
+        new_doc_ids = set(r[0] for r in valid_upserts.select("doc_id").collect() if r[0])
         valid_target_ids = existing_doc_ids.union(new_doc_ids)
 
         def clean_links(links_arr):
@@ -170,8 +175,8 @@ def run_ingestion(input_path, phase=None, master_url=None, warehouse_uri="hdfs:/
         deduped_df = valid_df.dropDuplicates(["doc_id"])
         print(f"[*] Unique documents after deduplication: {deduped_df.count()}")
 
-        # Dead link pruning
-        valid_doc_ids = set(deduped_df.select("doc_id").rdd.flatMap(lambda x: x).collect())
+        # Dead link pruning (pure driver list, no RDD conversion)
+        valid_doc_ids = set(r[0] for r in deduped_df.select("doc_id").collect() if r[0])
 
         def clean_links_p0(links_arr):
             if not links_arr:
