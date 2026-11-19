@@ -213,8 +213,11 @@ def run_ingestion(input_path, phase=None, master_url=None, warehouse_uri="hdfs:/
     print(f"[✓] Total active documents in 'iceberg_catalog.lake.pages': {total_in_table}")
 
     print("\n--- Iceberg Commit History (Snapshots) ---")
-    history_df = spark.sql("SELECT snapshot_id, committed_at FROM iceberg_catalog.lake.pages.history ORDER BY committed_at DESC LIMIT 5")
-    history_df.show(truncate=False)
+    try:
+        history_df = spark.sql("SELECT made_current_at, snapshot_id FROM iceberg_catalog.lake.pages.history ORDER BY made_current_at DESC LIMIT 5")
+        history_df.show(truncate=False)
+    except Exception:
+        spark.sql("SELECT * FROM iceberg_catalog.lake.pages.history LIMIT 5").show(truncate=False)
 
     print("==================================================")
     spark.stop()
