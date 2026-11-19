@@ -4,21 +4,23 @@ Node 1: Ingestion & Data Quality Pipeline
 Author: Sanjeev (Node 1 Lead)
 
 Requirements Satisfied:
-1. Parse and validate input records from JSONL.
-2. Reject malformed records or missing required fields.
-3. Deduplicate by document ID (highest version wins).
-4. Remove links to documents that do not exist (dead-link cleaning).
-5. Merge accepted changes into Apache Iceberg table (idempotent: re-running does not corrupt or duplicate data).
+1. Parse and validate input records from JSON / JSONL.
+2. Reject malformed records or missing required fields (doc_id, title, text).
+3. Deduplicate by doc_id.
+4. Remove dead/dangling links that point to documents not in the valid corpus.
+5. Idempotent Apache Iceberg operations:
+   - Phase 0: MERGE INTO iceberg_catalog.lake.pages
+   - Phase 1: DELETE (doc_id) and MERGE INTO (upserts)
+   - Re-running the pipeline is completely idempotent (no duplicates or corrupted state).
 """
 
 import sys
 import os
 import argparse
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, row_number, udf
-from pyspark.sql.window import Window
+from pyspark.sql.functions import col, udf, coalesce, lit
 from pyspark.sql.types import (
-    StructType, StructField, StringType, LongType, ArrayType
+    StructType, StructField, StringType, ArrayType
 )
 
 def create_spark_session(master_url=None, warehouse_uri="hdfs://node2:9000/iceberg"):
@@ -26,121 +28,196 @@ def create_spark_session(master_url=None, warehouse_uri="hdfs://node2:9000/icebe
         SparkSession.builder
         .appName("Node1-Ingestion-Pipeline")
         .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
-        .config("spark.sql.catalog.lakehouse", "org.apache.iceberg.spark.SparkCatalog")
-        .config("spark.sql.catalog.lakehouse.type", "hadoop")
-        .config("spark.sql.catalog.lakehouse.warehouse", warehouse_uri)
+        .config("spark.sql.catalog.iceberg_catalog", "org.apache.iceberg.spark.SparkCatalog")
+        .config("spark.sql.catalog.iceberg_catalog.type", "hadoop")
+        .config("spark.sql.catalog.iceberg_catalog.warehouse", warehouse_uri)
     )
     if master_url:
         builder = builder.master(master_url)
     return builder.getOrCreate()
 
-def run_ingestion(input_path, phase_name="phase0", master_url=None, warehouse_uri="hdfs://node2:9000/iceberg"):
+def run_ingestion(input_path, phase=None, master_url=None, warehouse_uri="hdfs://node2:9000/iceberg"):
     print(f"==================================================")
-    print(f"[*] Starting Ingestion Pipeline: Phase '{phase_name}'")
-    print(f"[*] Input file: {input_path}")
-    print(f"[*] Iceberg warehouse: {warehouse_uri}")
+    print(f"[*] Starting Ingestion Pipeline: Input='{input_path}'")
+    print(f"[*] Warehouse URI: {warehouse_uri}")
     print(f"==================================================")
 
     spark = create_spark_session(master_url, warehouse_uri)
     spark.sparkContext.setLogLevel("WARN")
 
-    # 1. Define Strict Expected Schema
-    expected_schema = StructType([
+    # Ensure Iceberg namespace and table exist
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS iceberg_catalog.lake")
+    spark.sql("""
+        CREATE TABLE IF NOT EXISTS iceberg_catalog.lake.pages (
+            doc_id STRING,
+            title STRING,
+            url STRING,
+            text STRING,
+            links ARRAY<STRING>
+        )
+        USING iceberg
+    """)
+
+    # 1. Flexible Schema to support doc_id (primary), id (fallback), and op (for Phase 1 changes)
+    input_schema = StructType([
+        StructField("doc_id", StringType(), True),
         StructField("id", StringType(), True),
         StructField("title", StringType(), True),
         StructField("url", StringType(), True),
         StructField("text", StringType(), True),
         StructField("links", ArrayType(StringType()), True),
-        StructField("version", LongType(), True)
+        StructField("op", StringType(), True)
     ])
 
-    # 2. Read and Validate
-    raw_df = spark.read.schema(expected_schema).json(input_path)
-    total_raw = raw_df.count()
-
-    # Reject records missing id, title, text, or version
-    valid_df = raw_df.filter(
-        col("id").isNotNull() &
-        (col("id") != "") &
-        col("title").isNotNull() &
-        col("text").isNotNull() &
-        col("version").isNotNull()
+    raw_df = spark.read.schema(input_schema).json(input_path)
+    # Normalize doc_id
+    normalized_df = raw_df.withColumn(
+        "doc_id",
+        coalesce(col("doc_id"), col("id"))
     )
-    total_valid = valid_df.count()
-    rejected_count = total_raw - total_valid
-    print(f"[*] Total raw records: {total_raw}")
-    print(f"[*] Valid records: {total_valid} | Rejected (dirty/missing fields): {rejected_count}")
 
-    # 3. Deduplication: By document ID, highest version wins
-    window_spec = Window.partitionBy("id").orderBy(col("version").desc())
-    deduped_df = (
-        valid_df
-        .withColumn("rank", row_number().over(window_spec))
-        .filter(col("rank") == 1)
-        .drop("rank")
-    )
-    total_deduped = deduped_df.count()
-    print(f"[*] Deduplicated records (highest version kept): {total_deduped}")
+    total_records = normalized_df.count()
+    print(f"[*] Read {total_records} raw records from {input_path}")
 
-    # 4. Clean Dangling Links
-    # Only keep links that point to documents present in this corpus
-    all_doc_ids = set([row["id"] for row in deduped_df.select("id").distinct().collect()])
+    # Determine phase if not explicitly provided
+    has_op = "op" in raw_df.columns and normalized_df.filter(col("op").isNotNull()).count() > 0
+    if not phase:
+        phase = "phase1" if has_op else "phase0"
 
-    # UDF to filter out dead links
-    def filter_valid_links(links_arr):
-        if not links_arr:
-            return []
-        return [l for l in links_arr if l in all_doc_ids]
+    print(f"[*] Executing pipeline for: {phase.upper()}")
 
-    clean_links_udf = udf(filter_valid_links, ArrayType(StringType()))
-    cleaned_df = deduped_df.withColumn("links", clean_links_udf(col("links")))
+    # ==========================================
+    # PHASE 1 HANDLING (Deletes + Upserts)
+    # ==========================================
+    if phase.lower() == "phase1" or has_op:
+        # Separate DELETEs and UPSERTs
+        deletes_df = normalized_df.filter(
+            col("op") == "DELETE"
+        ).filter(col("doc_id").isNotNull() & (col("doc_id") != ""))
 
-    # 5. Idempotent Apache Iceberg Merge
-    spark.sql("CREATE NAMESPACE IF NOT EXISTS lakehouse.default")
-    spark.sql("""
-        CREATE TABLE IF NOT EXISTS lakehouse.default.documents (
-            id STRING,
-            title STRING,
-            url STRING,
-            text STRING,
-            links ARRAY<STRING>,
-            version BIGINT
+        delete_ids = [r["doc_id"] for r in deletes_df.select("doc_id").distinct().collect()]
+        print(f"[*] Found {len(delete_ids)} DELETE operations.")
+
+        if delete_ids:
+            print(f"[*] Applying deletions to 'iceberg_catalog.lake.pages' (e.g., doc_id '1')...")
+            deletes_df.select("doc_id").distinct().createOrReplaceTempView("pending_deletes")
+            spark.sql("""
+                DELETE FROM iceberg_catalog.lake.pages
+                WHERE doc_id IN (SELECT doc_id FROM pending_deletes)
+            """)
+            print("[✓] Deletions applied successfully.")
+
+        # Process UPSERTs
+        upserts_df = normalized_df.filter(
+            (col("op") == "UPSERT") | col("op").isNull()
         )
-        USING iceberg
-    """)
+        valid_upserts = upserts_df.filter(
+            col("doc_id").isNotNull() & (col("doc_id") != "") &
+            col("title").isNotNull() & (col("title") != "") &
+            col("text").isNotNull() & (col("text") != "")
+        ).dropDuplicates(["doc_id"])
 
-    cleaned_df.createOrReplaceTempView("batch_updates")
+        print(f"[*] Valid UPSERT records: {valid_upserts.count()}")
 
-    # MERGE INTO guarantees that if Phase 0 or Phase 1 is submitted twice,
-    # it updates to highest version and does NOT create duplicate records!
-    merge_query = """
-        MERGE INTO lakehouse.default.documents target
-        USING batch_updates source
-        ON target.id = source.id
-        WHEN MATCHED AND source.version >= target.version THEN
-            UPDATE SET 
-                target.title = source.title,
-                target.url = source.url,
-                target.text = source.text,
-                target.links = source.links,
-                target.version = source.version
-        WHEN NOT MATCHED THEN
-            INSERT (id, title, url, text, links, version)
-            VALUES (source.id, source.title, source.url, source.text, source.links, source.version)
-    """
+        # Clean dangling links against existing docs in Iceberg + incoming upsert IDs
+        existing_doc_ids = set(
+            spark.sql("SELECT doc_id FROM iceberg_catalog.lake.pages").rdd.flatMap(lambda x: x).collect()
+        )
+        new_doc_ids = set(valid_upserts.select("doc_id").rdd.flatMap(lambda x: x).collect())
+        valid_target_ids = existing_doc_ids.union(new_doc_ids)
 
-    print("[*] Executing idempotent Iceberg MERGE INTO table 'lakehouse.default.documents'...")
-    spark.sql(merge_query)
+        def clean_links(links_arr):
+            if not links_arr:
+                return []
+            return [str(l) for l in links_arr if str(l) in valid_target_ids]
 
-    final_count = spark.sql("SELECT COUNT(*) as count FROM lakehouse.default.documents").collect()[0]["count"]
-    print(f"[✓] Ingestion successful! Current table record count: {final_count}")
-    print(f"==================================================")
+        clean_links_udf = udf(clean_links, ArrayType(StringType()))
+        cleaned_upserts = valid_upserts.withColumn("links", clean_links_udf(col("links")))
+
+        # Idempotent MERGE INTO
+        cleaned_upserts.select("doc_id", "title", "url", "text", "links").createOrReplaceTempView("batch_upserts")
+        merge_query = """
+            MERGE INTO iceberg_catalog.lake.pages target
+            USING batch_upserts source
+            ON target.doc_id = source.doc_id
+            WHEN MATCHED THEN
+                UPDATE SET
+                    target.title = source.title,
+                    target.url = source.url,
+                    target.text = source.text,
+                    target.links = source.links
+            WHEN NOT MATCHED THEN
+                INSERT (doc_id, title, url, text, links)
+                VALUES (source.doc_id, source.title, source.url, source.text, source.links)
+        """
+        print("[*] Merging Phase 1 upserts into 'iceberg_catalog.lake.pages'...")
+        spark.sql(merge_query)
+
+    # ==========================================
+    # PHASE 0 HANDLING (Initial Ingestion)
+    # ==========================================
+    else:
+        # Filter valid records: missing title or text or empty doc_id rejected
+        valid_df = normalized_df.filter(
+            col("doc_id").isNotNull() & (col("doc_id") != "") &
+            col("title").isNotNull() & (col("title") != "") &
+            col("text").isNotNull() & (col("text") != "")
+        )
+        valid_count = valid_df.count()
+        print(f"[*] Valid document records: {valid_count} (Rejected: {total_records - valid_count})")
+
+        # Deduplicate by doc_id
+        deduped_df = valid_df.dropDuplicates(["doc_id"])
+        print(f"[*] Unique documents after deduplication: {deduped_df.count()}")
+
+        # Dead link pruning
+        valid_doc_ids = set(deduped_df.select("doc_id").rdd.flatMap(lambda x: x).collect())
+
+        def clean_links_p0(links_arr):
+            if not links_arr:
+                return []
+            return [str(l) for l in links_arr if str(l) in valid_doc_ids]
+
+        clean_links_udf = udf(clean_links_p0, ArrayType(StringType()))
+        cleaned_df = deduped_df.withColumn("links", clean_links_udf(col("links")))
+
+        # Idempotent MERGE INTO
+        cleaned_df.select("doc_id", "title", "url", "text", "links").createOrReplaceTempView("phase0_docs")
+        merge_query = """
+            MERGE INTO iceberg_catalog.lake.pages target
+            USING phase0_docs source
+            ON target.doc_id = source.doc_id
+            WHEN MATCHED THEN
+                UPDATE SET
+                    target.title = source.title,
+                    target.url = source.url,
+                    target.text = source.text,
+                    target.links = source.links
+            WHEN NOT MATCHED THEN
+                INSERT (doc_id, title, url, text, links)
+                VALUES (source.doc_id, source.title, source.url, source.text, source.links)
+        """
+        print("[*] Merging Phase 0 pages into 'iceberg_catalog.lake.pages'...")
+        spark.sql(merge_query)
+
+    # ==========================================
+    # VERIFICATION & REPORTING
+    # ==========================================
+    total_in_table = spark.sql("SELECT COUNT(*) AS count FROM iceberg_catalog.lake.pages").collect()[0]["count"]
+    print(f"\n[✓] Ingestion Successful!")
+    print(f"[✓] Total active documents in 'iceberg_catalog.lake.pages': {total_in_table}")
+
+    print("\n--- Iceberg Commit History (Snapshots) ---")
+    history_df = spark.sql("SELECT snapshot_id, committed_at FROM iceberg_catalog.lake.pages.history ORDER BY committed_at DESC LIMIT 5")
+    history_df.show(truncate=False)
+
+    print("==================================================")
     spark.stop()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Node 1 Ingestion Pipeline")
-    parser.add_argument("input_path", help="Path to input jsonl file (e.g. data/pages.jsonl)")
-    parser.add_argument("--phase", default="phase0", help="Phase name (phase0 or phase1)")
+    parser.add_argument("input_path", help="Path to input jsonl file (e.g. data/pages.jsonl or data/changes.json)")
+    parser.add_argument("--phase", default=None, help="Phase override: 'phase0' or 'phase1'")
     parser.add_argument("--master", default=None, help="Spark master URL (e.g. spark://node3:7077)")
     parser.add_argument("--warehouse", default="hdfs://node2:9000/iceberg", help="Iceberg warehouse URI")
     args = parser.parse_args()

@@ -34,11 +34,23 @@ echo "[*] Creating required HDFS paths..."
 hdfs dfs -mkdir -p /iceberg
 hdfs dfs -mkdir -p /checkpoints
 hdfs dfs -mkdir -p /tmp
+hdfs dfs -mkdir -p /serving/v0
+hdfs dfs -mkdir -p /serving/v1
+hdfs dfs -mkdir -p /data
 hdfs dfs -chmod -R 777 /iceberg
 hdfs dfs -chmod -R 777 /checkpoints
 hdfs dfs -chmod -R 777 /tmp
+hdfs dfs -chmod -R 777 /serving
+hdfs dfs -chmod -R 777 /data
 
-# 5. Start Spark Worker 1
+# 5. Upload pages.jsonl if present locally (Evaluator checkpoint requirement)
+if [ -f "../data/pages.jsonl" ]; then
+    echo "[*] Uploading pages.jsonl to HDFS (/data/pages.jsonl)..."
+    hdfs dfs -put -f ../data/pages.jsonl /data/pages.jsonl
+    echo "[✓] pages.jsonl successfully stored on HDFS."
+fi
+
+# 6. Start Spark Worker 1
 echo "[*] Starting Spark Worker 1 (Connecting to Spark Master on Node 3)..."
 /opt/spark/sbin/start-worker.sh spark://node3:7077
 

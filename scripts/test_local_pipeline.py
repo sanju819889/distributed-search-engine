@@ -1,126 +1,170 @@
 #!/usr/bin/env python3
 """
 Full Pipeline Local Simulation & Verification
-Tests the entire algorithmic workflow:
-1. Ingestion: Cleaning, schema validation, deduplication (highest version wins), dead-link filtering.
-2. Indexing: Tokenization, TF, DF, doc lengths, avgdl.
-3. PageRank: 10 iterations, damping factor 0.85, normalization.
-4. BM25 & Final Ranking: k1=1.2, b=0.75, 0.7*BM25 + 0.3*PR.
+Tests the exact verification runbook logic:
+1. Phase 0 Ingestion: Schema validation, deduplication, dead-link cleaning.
+2. Phase 0 PageRank & Inverted Indexing.
+3. Verification of baseline: doc 94 title is "Beard", doc 146 baseline rank.
+4. Phase 1 Ingestion: Delete doc 1, update doc 94 to "Beard (Phase 1)", add new links to doc 146.
+5. Phase 1 PageRank & Inverted Indexing: Doc 1 deleted (count is 0), doc 146 rank increased.
+6. BM25 + PageRank Combined Ranking: k1=1.2, b=0.75, 0.7*BM25 + 0.3*PR.
 """
 
 import os
 import sys
 import json
-import re
-import math
 from collections import defaultdict
 
 # Add parent path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "node4_search")))
 from ranker import SearchRanker
 
-def simulate_pipeline():
-    print("==================================================")
-    print("      DISTRIBUTED SEARCH ENGINE - LOCAL SIMULATION")
-    print("==================================================")
-
-    # 1. Generate toy data
-    from generate_toy_data import generate_toy_data
-    generate_toy_data("data")
-
-    # 2. Ingestion (Phase 0)
-    print("\n--- Step 1: Ingestion & Validation (Phase 0) ---")
-    documents = {}
-    with open("data/toy_pages.jsonl") as f:
-        for line in f:
-            rec = json.loads(line)
-            doc_id = rec["id"]
-            ver = rec["version"]
-            # Deduplicate by highest version
-            if doc_id not in documents or ver > documents[doc_id]["version"]:
-                documents[doc_id] = rec
-
-    print(f"[✓] Deduplicated to {len(documents)} unique documents.")
-    
-    # Dead link cleaning
-    all_ids = set(documents.keys())
-    for d_id, doc in documents.items():
-        doc["links"] = [l for l in doc.get("links", []) if l in all_ids]
-    print("[✓] Dead links successfully purged.")
-
-    # 3. Compute PageRank (10 iterations, damping 0.85)
-    print("\n--- Step 2: PageRank (10 Iterations) ---")
-    damping = 0.85
+def run_pagerank(documents, iterations=10, damping=0.85):
     ranks = {d_id: 1.0 for d_id in documents}
-
-    for it in range(1, 11):
+    for it in range(1, iterations + 1):
         new_ranks = {d_id: (1.0 - damping) for d_id in documents}
         for d_id, doc in documents.items():
-            targets = doc.get("links", [])
+            targets = [t for t in doc.get("links", []) if t in documents]
             if targets:
                 share = (damping * ranks[d_id]) / len(targets)
                 for t in targets:
                     new_ranks[t] += share
             else:
-                # Dangling node distribution
-                share = (damping * ranks[d_id]) / len(documents)
+                share = (damping * ranks[d_id]) / max(1, len(documents))
                 for other in documents:
                     new_ranks[other] += share
         ranks = new_ranks
+    return ranks
 
-    print("[✓] PageRank 10-iteration scores:")
-    for d_id, score in ranks.items():
-        print(f"    - {d_id} ({documents[d_id]['title']}): {score:.4f}")
+def simulate_pipeline():
+    print("==================================================")
+    print(" DISTRIBUTED SEARCH ENGINE - VERIFICATION RUNBOOK")
+    print("==================================================")
 
-    # 4. Inverted Indexing
-    print("\n--- Step 3: Inverted Index & Term Frequencies ---")
-    inverted_index = defaultdict(dict)
-    doc_lens = {}
+    from generate_toy_data import generate_toy_data
+    generate_toy_data("data")
+
+    # --- PHASE 0 ---
+    print("\n--- [Phase 0] Ingestion ---")
+    documents = {}
+    with open("data/toy_pages.jsonl") as f:
+        for line in f:
+            rec = json.loads(line)
+            d_id = rec["doc_id"]
+            if d_id not in documents:
+                documents[d_id] = rec
+
+    print(f"[✓] Deduplicated to {len(documents)} unique documents.")
+    # Clean dead links
+    all_ids = set(documents.keys())
+    for d_id, doc in documents.items():
+        doc["links"] = [l for l in doc.get("links", []) if l in all_ids]
+
+    ranks_p0 = run_pagerank(documents)
+    print(f"[✓] Baseline Phase 0: doc 94 title = '{documents['94']['title']}'")
+    print(f"[✓] Baseline Phase 0: doc 146 PageRank = {ranks_p0['146']:.4f}")
+
+    # Build Ranker for Phase 0
     ranker = SearchRanker(k1=1.2, b=0.75)
-
+    idx_p0 = defaultdict(dict)
+    doc_lens_p0 = {}
     for d_id, doc in documents.items():
-        tokens = ranker.tokenize(doc["text"])
-        doc_lens[d_id] = max(1, len(tokens))
-        tf_map = defaultdict(int)
-        for t in tokens:
-            tf_map[t] += 1
-        for t, tf in tf_map.items():
-            inverted_index[t][d_id] = tf
+        toks = ranker.tokenize(doc["text"])
+        doc_lens_p0[d_id] = max(1, len(toks))
+        for t in toks:
+            idx_p0[t][d_id] = idx_p0[t].get(d_id, 0) + 1
 
-    avgdl = sum(doc_lens.values()) / len(doc_lens)
-    max_pr = max(ranks.values())
-
-    doc_catalog = {}
-    for d_id, doc in documents.items():
-        doc_catalog[d_id] = {
-            "title": doc["title"],
-            "url": doc["url"],
-            "doc_len": doc_lens[d_id],
-            "pagerank": ranks[d_id]
+    catalog_p0 = {
+        d_id: {
+            "title": documents[d_id]["title"],
+            "url": documents[d_id]["url"],
+            "doc_len": doc_lens_p0[d_id],
+            "pagerank": ranks_p0[d_id]
         }
-
+        for d_id in documents
+    }
     ranker.load_index(
-        inverted_index=inverted_index,
-        doc_catalog=doc_catalog,
+        inverted_index=idx_p0,
+        doc_catalog=catalog_p0,
         total_docs=len(documents),
-        avgdl=avgdl,
-        max_pagerank=max_pr,
-        version="sim_v0"
+        avgdl=sum(doc_lens_p0.values()) / len(doc_lens_p0),
+        max_pagerank=max(ranks_p0.values()),
+        version="v0"
     )
-    print(f"[✓] Indexed {len(inverted_index)} distinct terms across {len(documents)} documents. avgdl = {avgdl:.2f}")
 
-    # 5. Test Searches
-    queries = ["search engine", "algorithm", "computer"]
-    print("\n--- Step 4: Verification Queries ---")
-    for q in queries:
-        print(f"\nQuery: '{q}'")
-        res = ranker.search(q, top_k=3)
-        for rank_idx, item in enumerate(res, 1):
-            print(f"  [{rank_idx}] {item['title']} (ID: {item['doc_id']})")
-            print(f"      Final Score: {item['final_score']} | BM25: {item['bm25_score']} (Norm: {item['norm_bm25']}) | PageRank: {item['pagerank']:.4f} (Norm: {item['norm_pagerank']})")
+    search_beard_p0 = ranker.search("beard", top_k=1)
+    print(f"[✓] Search 'beard' (Phase 0): Title = '{search_beard_p0[0]['title']}'")
+    assert search_beard_p0[0]["title"] == "Beard", "Phase 0 title must be Beard"
+
+    # --- PHASE 1 ---
+    print("\n--- [Phase 1] Live Updates ---")
+    with open("data/toy_changes.jsonl") as f:
+        for line in f:
+            rec = json.loads(line)
+            d_id = rec["doc_id"]
+            op = rec.get("op")
+            if op == "DELETE":
+                if d_id in documents:
+                    del documents[d_id]
+                    print(f"[*] Deleted doc_id '{d_id}' from dataset.")
+            elif op == "UPSERT":
+                documents[d_id] = rec
+                print(f"[*] Upserted doc_id '{d_id}' into dataset.")
+
+    # Clean dead links
+    all_ids_p1 = set(documents.keys())
+    for d_id, doc in documents.items():
+        doc["links"] = [l for l in doc.get("links", []) if l in all_ids_p1]
+
+    # Verification: doc 1 must be deleted
+    assert "1" not in documents, "Doc 1 must be deleted in Phase 1!"
+    print("[✓] Verification 2.3 Passed: doc_id '1' count is 0!")
+
+    ranks_p1 = run_pagerank(documents)
+    print(f"[✓] Phase 1: doc 94 title = '{documents['94']['title']}'")
+    print(f"[✓] Phase 1: doc 146 PageRank = {ranks_p1['146']:.4f} (Baseline was {ranks_p0['146']:.4f})")
+    assert ranks_p1["146"] > ranks_p0["146"], "Doc 146 must gain PageRank!"
+    print("[✓] Verification 3.2 Passed: doc 146 gained rank!")
+
+    # Build Ranker for Phase 1
+    idx_p1 = defaultdict(dict)
+    doc_lens_p1 = {}
+    for d_id, doc in documents.items():
+        toks = ranker.tokenize(doc["text"])
+        doc_lens_p1[d_id] = max(1, len(toks))
+        for t in toks:
+            idx_p1[t][d_id] = idx_p1[t].get(d_id, 0) + 1
+
+    catalog_p1 = {
+        d_id: {
+            "title": documents[d_id]["title"],
+            "url": documents[d_id]["url"],
+            "doc_len": doc_lens_p1[d_id],
+            "pagerank": ranks_p1[d_id]
+        }
+        for d_id in documents
+    }
+    ranker.load_index(
+        inverted_index=idx_p1,
+        doc_catalog=catalog_p1,
+        total_docs=len(documents),
+        avgdl=sum(doc_lens_p1.values()) / len(doc_lens_p1),
+        max_pagerank=max(ranks_p1.values()),
+        version="v1"
+    )
+
+    search_beard_p1 = ranker.search("beard", top_k=1)
+    print(f"[✓] Search 'beard' (Phase 1): Title = '{search_beard_p1[0]['title']}'")
+    assert search_beard_p1[0]["title"] == "Beard (Phase 1)", "Phase 1 title must be 'Beard (Phase 1)'"
+    print("[✓] Verification 3.1 Passed: doc 94 updated in place to 'Beard (Phase 1)'!")
+
+    # Multi-word search
+    multi_res = ranker.search("distributed spark", top_k=2)
+    assert len(multi_res) > 0, "Multi-word search must return results"
+    print(f"[✓] Multi-word query 'distributed spark': {len(multi_res)} results returned successfully.")
 
     print("\n==================================================")
-    print(" [✓] ALL TESTS PASSED! Algorithm & logic 100% sound.")
+    print(" [✓] ALL EVALUATION CHECKS PASSED PERFECTLY!")
     print("==================================================")
 
 if __name__ == "__main__":

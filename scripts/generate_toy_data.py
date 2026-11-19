@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
 Generates synthetic toy datasets (toy_pages.jsonl & toy_changes.jsonl)
-matching the exact Wikipedia schema for rapid local testing.
+matching the exact real Wikipedia dataset schema:
+- doc_id
+- Phase 0: doc_id, url, title, text, links
+- Phase 1: doc_id, op ('DELETE' or 'UPSERT'), title, url, text, links
 """
 
 import os
@@ -13,45 +16,40 @@ def generate_toy_data(output_dir="data"):
     # Phase 0: 5 connected pages with 1 duplicate and 1 dead link
     pages = [
         {
-            "id": "doc1",
-            "title": "Computer Science",
-            "url": "https://simple.wikipedia.org/wiki/Computer_science",
-            "text": "Computer science is the study of computation, automation, information, and algorithms. Computers process data rapidly.",
-            "links": ["doc2", "doc3", "doc_does_not_exist"], # includes dead link
-            "version": 1
+            "doc_id": "1",
+            "title": "April",
+            "url": "https://simple.wikipedia.org/wiki/April",
+            "text": "April is the fourth month of the year in the Julian and Gregorian calendars. Spring flowers bloom.",
+            "links": ["94", "146", "9999"] # 9999 is dead link
         },
         {
-            "id": "doc2",
-            "title": "Algorithm",
-            "url": "https://simple.wikipedia.org/wiki/Algorithm",
-            "text": "An algorithm is a finite sequence of mathematically rigorous instructions used to solve class of problems or perform computation.",
-            "links": ["doc1", "doc3"],
-            "version": 1
+            "doc_id": "94",
+            "title": "Beard",
+            "url": "https://simple.wikipedia.org/wiki/Beard",
+            "text": "A beard is the hair growing on the lower part of a man's face. Mustache and whiskers.",
+            "links": ["1", "146"]
         },
         {
-            "id": "doc3",
-            "title": "Search Engine",
-            "url": "https://simple.wikipedia.org/wiki/Search_engine",
-            "text": "A search engine is an information retrieval system designed to help find information stored on computer system like the World Wide Web.",
-            "links": ["doc1", "doc4"],
-            "version": 1
+            "doc_id": "98",
+            "title": "Black",
+            "url": "https://simple.wikipedia.org/wiki/Black",
+            "text": "Black is a color and shade. Absorbs all wavelengths of light.",
+            "links": ["1"]
         },
         {
-            "id": "doc4",
-            "title": "PageRank",
-            "url": "https://simple.wikipedia.org/wiki/PageRank",
-            "text": "PageRank is an algorithm used by Google Search to rank web pages in search engine results. It measures the importance of website pages.",
-            "links": ["doc3"],
-            "version": 1
+            "doc_id": "146",
+            "title": "Cooking",
+            "url": "https://simple.wikipedia.org/wiki/Cooking",
+            "text": "Cooking is the art, technology, science and craft of preparing food for consumption with heat.",
+            "links": ["1"]
         },
-        # Duplicate of doc1 with lower version (should be ignored by deduplication)
+        # Duplicate of doc 1 (should be deduplicated)
         {
-            "id": "doc1",
-            "title": "Old Computer Science",
-            "url": "https://simple.wikipedia.org/wiki/Computer_science_old",
-            "text": "Old outdated text.",
-            "links": ["doc2"],
-            "version": 0
+            "doc_id": "1",
+            "title": "April",
+            "url": "https://simple.wikipedia.org/wiki/April",
+            "text": "April is the fourth month of the year.",
+            "links": ["94"]
         }
     ]
 
@@ -61,23 +59,38 @@ def generate_toy_data(output_dir="data"):
             f.write(json.dumps(p) + "\n")
     print(f"[✓] Created {p0_file}")
 
-    # Phase 1: 1 updated page (higher version) and 1 brand new page
+    # Phase 1:
+    # 1. Delete doc 1 ("April")
+    # 2. Update doc 94 title to "Beard (Phase 1)"
+    # 3. Add link to 146 from doc 98 and new doc phase1-new-001 so doc 146 gains rank
     changes = [
         {
-            "id": "doc3",
-            "title": "Distributed Search Engine",
-            "url": "https://simple.wikipedia.org/wiki/Search_engine",
-            "text": "A distributed search engine uses Apache Spark, HDFS, and Apache Iceberg to index and search millions of web documents with high throughput.",
-            "links": ["doc1", "doc4", "doc5"],
-            "version": 2
+            "doc_id": "1",
+            "op": "DELETE"
         },
         {
-            "id": "doc5",
-            "title": "Apache Spark",
+            "doc_id": "94",
+            "title": "Beard (Phase 1)",
+            "url": "https://simple.wikipedia.org/wiki/Beard",
+            "text": "A beard is hair on a man face. Updated in phase 1 with new information.",
+            "links": ["146"],
+            "op": "UPSERT"
+        },
+        {
+            "doc_id": "98",
+            "title": "Black (Phase 1)",
+            "url": "https://simple.wikipedia.org/wiki/Black",
+            "text": "Black is a color. Pigment absorbs light.",
+            "links": ["146"],
+            "op": "UPSERT"
+        },
+        {
+            "doc_id": "phase1-new-001",
+            "title": "Apache Spark Distributed Computing",
             "url": "https://simple.wikipedia.org/wiki/Apache_Spark",
-            "text": "Apache Spark is an open-source unified analytics engine for large-scale data processing and distributed machine learning.",
-            "links": ["doc1", "doc3"],
-            "version": 1
+            "text": "Apache Spark provides high speed distributed indexing and PageRank computation for search engines.",
+            "links": ["94", "146"],
+            "op": "UPSERT"
         }
     ]
 

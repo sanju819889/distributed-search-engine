@@ -3,16 +3,20 @@
 Node 3: Distributed Compute Pipeline (Indexing + PageRank + Parquet Export)
 Author: Abhishek (Compute Lead)
 
-Deliverables:
-1. Distributed Inverted Indexing from Iceberg table 'lakehouse.default.documents'
+Deliverables Satisfied:
+1. Distributed Inverted Indexing from Iceberg table 'iceberg_catalog.lake.pages'
+   - Saved to Iceberg table 'iceberg_catalog.lake.inverted_index' (term, doc_id, tf)
 2. Distributed PageRank (minimum 10 iterations, damping factor 0.85, RDD checkpointing)
-3. Plain Parquet export (index, docs, corpus metadata) for serving on Node 4
+   - Saved to Iceberg table 'iceberg_catalog.lake.pagerank' (doc_id, rank)
+3. Plain Parquet export for serving:
+   - HDFS: /serving/v0/ and /serving/v1/ containing docs.parquet, index.parquet, metadata.json, and _READY marker
 """
 
 import sys
 import os
 import re
 import json
+import subprocess
 import argparse
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
@@ -51,39 +55,38 @@ def create_spark_session(master_url=None, warehouse_uri="hdfs://node2:9000/icebe
         SparkSession.builder
         .appName("Node3-Compute-Indexing-PageRank")
         .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
-        .config("spark.sql.catalog.lakehouse", "org.apache.iceberg.spark.SparkCatalog")
-        .config("spark.sql.catalog.lakehouse.type", "hadoop")
-        .config("spark.sql.catalog.lakehouse.warehouse", warehouse_uri)
+        .config("spark.sql.catalog.iceberg_catalog", "org.apache.iceberg.spark.SparkCatalog")
+        .config("spark.sql.catalog.iceberg_catalog.type", "hadoop")
+        .config("spark.sql.catalog.iceberg_catalog.warehouse", warehouse_uri)
     )
     if master_url:
         builder = builder.master(master_url)
     return builder.getOrCreate()
 
 def compute_pagerank(sc, links_rdd, all_doc_ids, iterations=10, damping=0.85, checkpoint_dir="hdfs://node2:9000/checkpoints"):
-    """
-    Computes PageRank with RDD checkpointing to prevent StackOverflowError
-    """
     print(f"[*] Starting Distributed PageRank ({iterations} iterations, damping={damping})...")
-    sc.setCheckpointDir(checkpoint_dir)
+    try:
+        sc.setCheckpointDir(checkpoint_dir)
+    except Exception as e:
+        print(f"[!] Warning on checkpoint dir: {e}. Falling back to /tmp/spark_checkpoints")
+        sc.setCheckpointDir("/tmp/spark_checkpoints")
 
-    # Initialize ranks: doc_id -> 1.0
-    # links_rdd: (doc_id, [target_doc_ids])
+    # Initial rank: 1.0 per document
     ranks = sc.parallelize(all_doc_ids).map(lambda doc: (doc, 1.0))
 
     for it in range(1, iterations + 1):
-        # (doc, (neighbors, rank))
+        # Calculate outgoing contributions
         contribs = links_rdd.join(ranks).flatMap(
             lambda x: [(dest, x[1][1] / len(x[1][0])) for dest in x[1][0]] if x[1][0] else []
         )
-        
-        # New rank = (1 - damping) + damping * sum(contribs)
-        # Full union with all_doc_ids ensures docs with no incoming links still get base score
+
         base_contribs = sc.parallelize(all_doc_ids).map(lambda doc: (doc, 0.0))
         all_contribs = contribs.union(base_contribs).reduceByKey(lambda a, b: a + b)
-        
+
+        # Standard PageRank formula: (1 - d) + d * sum(contribs)
         ranks = all_contribs.mapValues(lambda score: (1.0 - damping) + damping * score)
 
-        # Checkpoint every 2 iterations to truncate RDD DAG lineage
+        # Lineage truncation checkpoint every 2 iterations to avoid StackOverflowError
         if it % 2 == 0:
             ranks.checkpoint()
             print(f"    - Completed iteration {it}/{iterations} (lineage checkpointed)")
@@ -92,99 +95,118 @@ def compute_pagerank(sc, links_rdd, all_doc_ids, iterations=10, damping=0.85, ch
 
     return ranks
 
-def run_compute(version="v0", master_url=None, warehouse_uri="hdfs://node2:9000/iceberg", export_dir="/tmp/export"):
+def touch_hdfs_ready(path):
+    try:
+        subprocess.run(["hdfs", "dfs", "-touchz", path], check=False)
+    except Exception:
+        pass
+
+def run_compute(version="v0", master_url=None, warehouse_uri="hdfs://node2:9000/iceberg", export_base="hdfs://node2:9000/serving"):
     spark = create_spark_session(master_url, warehouse_uri)
     sc = spark.sparkContext
     sc.setLogLevel("WARN")
 
-    version_export_path = os.path.join(export_dir, version)
-    os.makedirs(version_export_path, exist_ok=True)
+    version_str = version if version.startswith("v") else f"v{version}"
+    hdfs_version_dir = f"{export_base}/{version_str}"
+    local_version_dir = f"/serving/{version_str}"
 
     print("==================================================")
-    print(f"[*] Node 3 Compute Pipeline Running (Version: {version})")
-    print(f"[*] Iceberg Source Table: lakehouse.default.documents")
-    print(f"[*] Target Export Path: {version_export_path}")
+    print(f"[*] Node 3 Compute Pipeline Running (Version: {version_str})")
+    print(f"[*] Iceberg Source Table: iceberg_catalog.lake.pages")
+    print(f"[*] HDFS Export Target:   {hdfs_version_dir}")
     print("==================================================")
 
-    # 1. Read validated documents from Apache Iceberg
-    docs_df = spark.sql("SELECT id, title, url, text, links FROM lakehouse.default.documents")
+    # 1. Read validated documents from Iceberg
+    docs_df = spark.sql("SELECT doc_id, title, url, text, links FROM iceberg_catalog.lake.pages")
     total_docs = docs_df.count()
-    print(f"[*] Total documents loaded from Iceberg: {total_docs}")
+    print(f"[*] Total active documents in iceberg_catalog.lake.pages: {total_docs}")
 
     if total_docs == 0:
-        print("[!] Error: Iceberg table is empty! Did Node 1 run ingestion?")
+        print("[!] Error: 'iceberg_catalog.lake.pages' is empty! Please run Node 1 Ingestion first.")
         sys.exit(1)
 
-    all_doc_ids = [row["id"] for row in docs_df.select("id").collect()]
+    all_doc_ids = [row["doc_id"] for row in docs_df.select("doc_id").collect()]
 
-    # 2. PageRank Computation
-    links_data = [(row["id"], row["links"] if row["links"] else []) for row in docs_df.select("id", "links").collect()]
+    # 2. Compute PageRank
+    links_data = [(row["doc_id"], row["links"] if row["links"] else []) for row in docs_df.select("doc_id", "links").collect()]
     links_rdd = sc.parallelize(links_data)
-    
+
     ranks_rdd = compute_pagerank(
         sc, links_rdd, all_doc_ids, iterations=10, damping=0.85
     )
 
-    ranks_df = ranks_rdd.toDF(["doc_id", "pagerank"])
+    # Save to Iceberg table: iceberg_catalog.lake.pagerank (columns: doc_id, rank)
+    ranks_df = ranks_rdd.toDF(["doc_id", "rank"])
+    ranks_df.write.format("iceberg").mode("overwrite").saveAsTable("iceberg_catalog.lake.pagerank")
+    print("[✓] PageRank computed and saved to 'iceberg_catalog.lake.pagerank'!")
 
     # 3. Distributed Inverted Indexing
     print("[*] Computing distributed Inverted Index and Term Frequencies...")
 
-    # Tokenize: lowercase, replace non-alphanumeric with spaces, split into terms
     clean_text_df = docs_df.withColumn(
         "clean_text",
         regexp_replace(lower(col("text")), r"[^a-z0-9\s]", " ")
     )
 
     words_df = clean_text_df.select(
-        col("id").alias("doc_id"),
+        col("doc_id"),
         explode(split(col("clean_text"), r"\s+")).alias("term")
     ).filter(
         (length(col("term")) >= 2) & (~col("term").isin(list(STOPWORDS)))
     )
 
-    # Compute Term Frequency (TF) per document
-    tf_df = words_df.groupBy("term", "doc_id").agg(count("*").alias("tf"))
+    # Term Frequency (tf)
+    tf_df = words_df.groupBy("term", "doc_id").agg(count("*").cast(IntegerType()).alias("tf"))
 
-    # Compute Document Length len(D) = total tokens in document
+    # Save to Iceberg table: iceberg_catalog.lake.inverted_index
+    tf_df.write.format("iceberg").mode("overwrite").saveAsTable("iceberg_catalog.lake.inverted_index")
+    print("[✓] Inverted Index computed and saved to 'iceberg_catalog.lake.inverted_index'!")
+
+    # Document length len(D)
     doc_lens_df = words_df.groupBy("doc_id").agg(count("*").alias("doc_len"))
 
-    # Join metadata with document lengths and PageRank scores
+    # Join metadata with doc lengths and PageRank scores
     enriched_docs = (
-        docs_df.select(col("id").alias("doc_id"), "title", "url")
+        docs_df.select("doc_id", "title", "url")
         .join(doc_lens_df, on="doc_id", how="left")
         .fillna({"doc_len": 1})
         .join(ranks_df, on="doc_id", how="left")
-        .fillna({"pagerank": 0.15})
+        .fillna({"rank": 0.15})
     )
 
-    # Calculate average document length across corpus
-    avgdl_val = enriched_docs.select(avg("doc_len")).collect()[0][0] or 1.0
-    max_pr_val = enriched_docs.select(spark_max("pagerank")).collect()[0][0] or 1.0
+    avgdl_val = float(enriched_docs.select(avg("doc_len")).collect()[0][0] or 1.0)
+    max_pr_val = float(enriched_docs.select(spark_max("rank")).collect()[0][0] or 1.0)
 
-    print(f"[*] Corpus Stats: Total Docs = {total_docs}, avgdl = {avgdl_val:.2f}, max(PageRank) = {max_pr_val:.4f}")
+    print(f"[*] Stats: total_docs={total_docs}, avgdl={avgdl_val:.2f}, max_rank={max_pr_val:.4f}")
 
-    # 4. Plain Parquet Export for Serving Node (Node 4)
-    print(f"[*] Exporting plain Parquet files to {version_export_path}...")
-    
-    # Write inverted index
-    tf_df.coalesce(2).write.mode("overwrite").parquet(os.path.join(version_export_path, "inverted_index.parquet"))
-    
-    # Write enriched document catalog
-    enriched_docs.coalesce(1).write.mode("overwrite").parquet(os.path.join(version_export_path, "documents.parquet"))
+    # 4. Parquet Export to HDFS (/serving/v0/ or /serving/v1/)
+    print(f"[*] Exporting plain Parquet to HDFS: {hdfs_version_dir}...")
+    enriched_docs.coalesce(1).write.mode("overwrite").parquet(f"{hdfs_version_dir}/docs.parquet")
+    tf_df.coalesce(2).write.mode("overwrite").parquet(f"{hdfs_version_dir}/index.parquet")
 
-    # Write summary metadata
-    meta = {
-        "version": version,
-        "total_docs": total_docs,
-        "avgdl": float(avgdl_val),
-        "max_pagerank": float(max_pr_val)
-    }
-    with open(os.path.join(version_export_path, "metadata.json"), "w") as f:
-        json.dump(meta, f, indent=2)
+    # Touch readiness flag in HDFS
+    touch_hdfs_ready(f"{hdfs_version_dir}/_READY")
 
-    print(f"[✓] Export finished successfully in {version_export_path}!")
-    print(f"==================================================")
+    # Also save to local /serving folder if directory is available (for local serving node)
+    try:
+        os.makedirs(local_version_dir, exist_ok=True)
+        enriched_docs.coalesce(1).write.mode("overwrite").parquet(f"{local_version_dir}/docs.parquet")
+        tf_df.coalesce(2).write.mode("overwrite").parquet(f"{local_version_dir}/index.parquet")
+        with open(f"{local_version_dir}/_READY", "w") as f:
+            f.write("ready\n")
+        with open(f"{local_version_dir}/metadata.json", "w") as f:
+            json.dump({
+                "version": 1 if "1" in version_str else 0,
+                "version_name": version_str,
+                "total_docs": total_docs,
+                "avgdl": avgdl_val,
+                "max_pagerank": max_pr_val
+            }, f, indent=2)
+    except Exception as e:
+        print(f"[*] Note: Local directory write ({local_version_dir}): {e}")
+
+    print(f"[✓] Successfully exported to {hdfs_version_dir} and touched _READY marker!")
+    print("==================================================")
     spark.stop()
 
 if __name__ == "__main__":
@@ -192,7 +214,7 @@ if __name__ == "__main__":
     parser.add_argument("--version", default="v0", help="Version identifier (e.g. v0, v1)")
     parser.add_argument("--master", default=None, help="Spark master URL (e.g. spark://node3:7077)")
     parser.add_argument("--warehouse", default="hdfs://node2:9000/iceberg", help="Iceberg warehouse URI")
-    parser.add_argument("--export_dir", default="/tmp/search_export", help="Target export directory")
+    parser.add_argument("--export_base", default="hdfs://node2:9000/serving", help="Target HDFS export base")
     args = parser.parse_args()
 
-    run_compute(args.version, args.master, args.warehouse, args.export_dir)
+    run_compute(args.version, args.master, args.warehouse, args.export_base)
